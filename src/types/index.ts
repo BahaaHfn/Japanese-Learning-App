@@ -109,7 +109,7 @@ export interface ClickableWord {
   expr: string;
   reading: string;
   meaningEn: string;
-  meaningAr: string;
+  meaningAr?: string;
   category?: ThematicCategory;
 }
 
@@ -133,6 +133,47 @@ export interface ReadingPassage {
   questions: ReadingQuestion[];
 }
 
+export type MondaiCategory =
+  | 'mondai-1' // Vocab: Kanji Reading (漢字読み)
+  | 'mondai-2' // Vocab: Orthography (表記)
+  | 'mondai-3' // Vocab: Contextual (文脈規定)
+  | 'mondai-4' // Vocab: Paraphrases / Synonyms (言い換え類義)
+  | 'mondai-5' // Vocab: Correct Usage (用法)
+  | 'grammar-form' // Grammar: Form Selection (文法形式の判断)
+  | 'grammar-star' // Grammar: Sentence Reordering ★ (文の組み立て)
+  | 'grammar-cloze' // Grammar: Discourse & Passage Cloze (文章の文法)
+  | 'reading'; // Reading Comprehension
+
+export interface OptionGloss {
+  option: string;
+  meaningEn: string;
+  meaningAr: string;
+  isCorrect?: boolean;
+  whyWrongEn?: string;
+  whyWrongAr?: string;
+}
+
+export interface TrackedMistake {
+  questionId: string;
+  consecutiveCorrect: number; // 0, 1 -> graduates at 2
+  failedCount: number;
+  lastFailed: string;
+  question: MockQuestion;
+}
+
+export interface MockTestMetadata {
+  id: string;
+  title: string;
+  description: string;
+  totalQuestions: number;
+  block1Count: number;
+  block2Count: number;
+  bestScore?: number;
+  passedFloor?: boolean;
+  status: 'Not Started' | 'In Progress' | 'Completed';
+  completedAt?: string;
+}
+
 export interface MockQuestion {
   id: string;
   block: 1 | 2; // 1: Vocab (30m), 2: Grammar & Reading (70m)
@@ -142,16 +183,23 @@ export interface MockQuestion {
     | 'Contextual'
     | 'ContextualVocab'
     | 'Paraphrase'
+    | 'Usage'
     | 'GrammarForm'
     | 'StarReordering'
     | 'GrammarStar'
     | 'ReadingPassage';
+  mondai?: MondaiCategory;
+  mockTestId?: string; // e.g. 'mock-test-1', 'mock-test-2'
   prompt: string;
   passageText?: string;
-  options: [string, string, string, string];
+  options: [string, string, string, string] | string[];
   correct: number; // 0-3
   explanationEn: string;
   explanationAr: string;
+  sentenceTranslationEn?: string;
+  sentenceTranslationAr?: string;
+  optionGlosses?: OptionGloss[];
+  clickableWords?: ClickableWord[];
   relatedItem?: {
     expr: string;
     reading: string;

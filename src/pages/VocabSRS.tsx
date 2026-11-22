@@ -4,10 +4,21 @@ import { FuriganaText } from '../components/common/FuriganaText';
 import { SectionContextHeader } from '../components/common/SectionContextHeader';
 import { BilingualBlock } from '../components/common/BilingualBlock';
 import { MasteryPillSelector } from '../components/common/MasteryPillSelector';
+import { InteractiveSentence, ClickableWord } from '../components/common/InteractiveSentence';
+import { MigiiFeedbackCard } from '../components/common/MigiiFeedbackCard';
 import { VocabCategoryHub } from '../components/vocab/VocabCategoryHub';
 import { KanjiMasteryGrid } from '../components/kanji/KanjiMasteryGrid';
-import { getNextIntervals, getMasteryPriorityWeight } from '../lib/fsrs';
-import { StudyItem, ThematicCategory } from '../types';
+import { getNextIntervals } from '../lib/fsrs';
+import {
+  shuffleArray,
+  sampleMasteryBatch,
+  generateSmartDistractors,
+  shuffleQuestionOptions,
+  getMistakesQueue,
+  recordMistake,
+  recordCorrectMistake,
+} from '../lib/questionEngine';
+import { StudyItem, ThematicCategory, OptionGloss, MockQuestion, TrackedMistake } from '../types';
 import {
   CheckCircle2,
   XCircle,
@@ -16,20 +27,51 @@ import {
   Layers,
   LayoutGrid,
   Filter,
+  Shuffle,
+  AlertTriangle,
+  BookOpen,
 } from 'lucide-react';
 
 type SubView = 'drill' | 'categories' | 'kanji-grid';
 type Mode = 'flashcard' | 'quiz';
-type QuizSubtype = 'KanjiReading' | 'Orthography' | 'Contextual';
+type MondaiQuizSubtype =
+  | 'Mondai1_Reading'
+  | 'Mondai2_Orthography'
+  | 'Mondai3_Contextual'
+  | 'Mondai4_Paraphrase'
+  | 'Mondai5_Usage';
 
-interface QuizQuestion {
+interface RichQuizQuestion {
   promptText: string;
+  sentenceContext?: string;
+  sentenceTranslationEn?: string;
+  sentenceTranslationAr?: string;
   options: string[];
   correctIndex: number;
+  explanationEn: string;
+  explanationAr: string;
+  optionGlosses: OptionGloss[];
+  clickableWords: ClickableWord[];
+  sourceQuestionId?: string;
+  relatedItem?: {
+    expr: string;
+    reading: string;
+    meaningEn: string;
+    meaningAr?: string;
+    subskill?: any;
+  };
 }
 
 export const VocabSRS: React.FC = () => {
-  const { vocabItems, rateVocab, updateItemMastery, settings, setActivePillar } = useApp();
+  const {
+    vocabItems,
+    rateVocab,
+    updateItemMastery,
+    settings,
+    setActivePillar,
+    enqueueWeakItem,
+    addToast,
+  } = useApp();
 
   const [subView, setSubView] = useState<SubView>('drill');
   const [mode, setMode] = useState<Mode>('flashcard');
@@ -37,9 +79,14 @@ export const VocabSRS: React.FC = () => {
   const [unmasteredOnly, setUnmasteredOnly] = useState<boolean>(false);
   const [selectedCategory, setSelectedCategory] = useState<ThematicCategory | 'all'>('all');
   const [subskillFilter, setSubskillFilter] = useState<'all' | 'Vocab' | 'Kanji' | 'Grammar'>('all');
-  const [quizSubtype, setQuizSubtype] = useState<QuizSubtype>('KanjiReading');
+  const [mondaiSubtype, setMondaiSubtype] = useState<MondaiQuizSubtype>('Mondai1_Reading');
 
-  // Flashcard state
+  // Mistakes queue mode
+  const [isMistakeMode, setIsMistakeMode] = useState<boolean>(false);
+  const [mistakesQueue, setMistakesQueue] = useState<TrackedMistake[]>([]);
+
+  // Randomized Active Batch (Fisher-Yates Mastery Weighted)
+  const [studyBatch, setStudyBatch] = useState<StudyItem[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
 
@@ -50,15 +97,24 @@ export const VocabSRS: React.FC = () => {
   // Quiz state
   const [quizSelectedOption, setQuizSelectedOption] = useState<number | null>(null);
   const [quizAnswerRevealed, setQuizAnswerRevealed] = useState<boolean>(false);
-  const [quizData, setQuizData] = useState<QuizQuestion | null>(null);
+  const [richQuizData, setRichQuizData] = useState<RichQuizQuestion | null>(null);
 
-  // Separate kanji items for the visual grid
+  // Refresh mistakes queue from storage
+  const refreshMistakes = useCallback(() => {
+    setMistakesQueue(getMistakesQueue());
+  }, []);
+
+  useEffect(() => {
+    refreshMistakes();
+  }, [refreshMistakes]);
+
+  // Separate kanji items for visual grid
   const kanjiItems = useMemo(() => {
     return vocabItems.filter((i) => i.subskill === 'Kanji');
   }, [vocabItems]);
 
-  // Active study deck filtered and prioritized by Mastery Degree
-  const activeDeck = useMemo(() => {
+  // Filtered master pool based on current settings
+  const filteredMasterPool = useMemo(() => {
     let list = vocabItems.filter((i) => !i.suspended);
 
     if (leechOnly) {
@@ -74,17 +130,60 @@ export const VocabSRS: React.FC = () => {
       list = list.filter((i) => i.subskill === subskillFilter);
     }
 
-    // Sort by priority weight: 1 (Weak: 3x) -> 2 (Shaky: 2x) -> 3 (Familiar: 1x) -> 4 (Mastered: 0.2x)
-    return [...list].sort((a, b) => {
-      const wA = getMasteryPriorityWeight(a.masteryLevel || 2);
-      const wB = getMasteryPriorityWeight(b.masteryLevel || 2);
-      return wB - wA;
-    });
+    return list;
   }, [vocabItems, leechOnly, unmasteredOnly, selectedCategory, subskillFilter]);
 
-  const currentItem: StudyItem | undefined = activeDeck[currentIndex];
+  // Sample a fresh randomized mastery-weighted batch
+  const sampleNewBatch = useCallback(
+    (deck: StudyItem[], count = 15) => {
+      if (deck.length === 0) {
+        setStudyBatch([]);
+        setCurrentIndex(0);
+        return;
+      }
+      const sampled = sampleMasteryBatch(deck, count, true);
+      setStudyBatch(sampled);
+      setCurrentIndex(0);
+      setIsFlipped(false);
+      setQuizSelectedOption(null);
+      setQuizAnswerRevealed(false);
+    },
+    []
+  );
 
-  // Calculate next adaptive sprint intervals for current card
+  // Resample batch when filters change
+  useEffect(() => {
+    if (!isMistakeMode) {
+      sampleNewBatch(filteredMasterPool, 15);
+    }
+  }, [filteredMasterPool, isMistakeMode, sampleNewBatch]);
+
+  // Active current item
+  const currentItem: StudyItem | undefined = useMemo(() => {
+    if (isMistakeMode) {
+      const mistake = mistakesQueue[currentIndex];
+      if (!mistake) return undefined;
+      const q = mistake.question;
+      return (
+        (q.relatedItem as StudyItem) || {
+          id: q.id,
+          expr: q.prompt.match(/【(.*?)】/) ? q.prompt.match(/【(.*?)】/)![1] : q.prompt.slice(0, 4),
+          reading: q.options[q.correct] || '',
+          meaningEn: q.explanationEn,
+          meaningAr: q.explanationAr,
+          example: q.prompt,
+          exampleEn: q.sentenceTranslationEn,
+          exampleAr: q.sentenceTranslationAr,
+          source: 'Mistakes Queue',
+          subskill: 'Vocab',
+          masteryLevel: 1,
+        }
+      );
+    }
+    return studyBatch[currentIndex];
+  }, [isMistakeMode, mistakesQueue, studyBatch, currentIndex]);
+
+  // Next intervals for FSRS
   const nextIntervals = useMemo(() => {
     if (!currentItem) return null;
     return getNextIntervals(currentItem, settings.examCap5Days);
@@ -98,7 +197,7 @@ export const VocabSRS: React.FC = () => {
     setQuizAnswerRevealed(false);
   }, [currentIndex, currentItem?.id]);
 
-  // Average seconds per question pacing metric
+  // Pacing metric
   const avgSeconds = useMemo(() => {
     if (paceTimes.length === 0) return 0;
     const sum = paceTimes.reduce((a, b) => a + b, 0);
@@ -116,95 +215,269 @@ export const VocabSRS: React.FC = () => {
       if (!currentItem) return;
       recordPaceTime();
       rateVocab(currentItem.id, grade);
-
       setIsFlipped(false);
 
-      if (currentIndex < activeDeck.length - 1) {
+      const totalItems = isMistakeMode ? mistakesQueue.length : studyBatch.length;
+      if (currentIndex < totalItems - 1) {
         setCurrentIndex((prev) => prev + 1);
       } else {
-        setCurrentIndex(0);
+        if (!isMistakeMode) {
+          sampleNewBatch(filteredMasterPool, 15);
+          addToast('Generated next randomized study set!', 'info');
+        } else {
+          setCurrentIndex(0);
+        }
       }
     },
-    [currentItem, currentIndex, activeDeck.length, rateVocab]
+    [
+      currentItem,
+      currentIndex,
+      isMistakeMode,
+      mistakesQueue.length,
+      studyBatch.length,
+      rateVocab,
+      sampleNewBatch,
+      filteredMasterPool,
+      addToast,
+    ]
   );
 
-  // Generate stable quiz question for current item
+  // Generate Rich Quiz Question (Migii JLPT Mondai Structure)
   useEffect(() => {
-    if (!currentItem || activeDeck.length < 2) {
-      setQuizData(null);
+    if (!currentItem) {
+      setRichQuizData(null);
       return;
     }
 
-    let promptText = '';
-    let targetAnswer = '';
+    // If in mistake mode and we have the full original MockQuestion stored
+    if (isMistakeMode) {
+      const mistake = mistakesQueue[currentIndex];
+      if (mistake && mistake.question) {
+        const q = mistake.question;
+        const clickableWords: ClickableWord[] = q.clickableWords || (q.relatedItem ? [
+          {
+            expr: q.relatedItem.expr,
+            reading: q.relatedItem.reading,
+            meaningEn: q.relatedItem.meaningEn,
+            meaningAr: q.relatedItem.meaningAr,
+          },
+        ] : []);
 
-    if (quizSubtype === 'KanjiReading') {
-      if (currentItem.subskill === 'Kanji') {
-        promptText = `What is the correct On/Kun reading for「${currentItem.expr}」?`;
-      } else {
-        promptText = `What is the correct hiragana reading for「${currentItem.expr}」?`;
+        const optionGlosses: OptionGloss[] =
+          q.optionGlosses ||
+          q.options.map((opt, idx) => ({
+            option: opt,
+            meaningEn: idx === q.correct ? q.explanationEn : 'Distractor choice',
+            meaningAr: idx === q.correct ? q.explanationAr : '',
+            isCorrect: idx === q.correct,
+          }));
+
+        setRichQuizData({
+          promptText: q.prompt,
+          sentenceContext: q.passageText,
+          sentenceTranslationEn: q.sentenceTranslationEn,
+          sentenceTranslationAr: q.sentenceTranslationAr,
+          options: q.options,
+          correctIndex: q.correct,
+          explanationEn: q.explanationEn,
+          explanationAr: q.explanationAr,
+          optionGlosses,
+          clickableWords,
+          sourceQuestionId: q.id,
+          relatedItem: q.relatedItem,
+        });
+        return;
       }
-      targetAnswer = currentItem.reading;
-    } else if (quizSubtype === 'Orthography') {
-      promptText = `Which kanji correctly corresponds to the reading「${currentItem.reading}」(${currentItem.meaningEn})?`;
-      targetAnswer = currentItem.expr;
+    }
+
+    // Dynamic Mondai generator from currentItem
+    const targetExpr = currentItem.expr;
+    const targetReading = currentItem.reading || currentItem.expr;
+    const meaningEn = currentItem.meaningEn || '';
+    const meaningAr = currentItem.meaningAr || '';
+    const example = currentItem.example || '';
+    const exampleEn = currentItem.exampleEn || '';
+    const exampleAr = currentItem.exampleAr || '';
+
+    let promptText = '';
+    let correctOption = '';
+    let distractors: string[] = [];
+    let explanationEn = '';
+    let explanationAr = '';
+
+    if (mondaiSubtype === 'Mondai1_Reading') {
+      // Mondai 1: Kanji Reading
+      if (example && example.includes(targetExpr)) {
+        promptText = example.replace(targetExpr, `【${targetExpr}】`);
+      } else {
+        promptText = `次の文の【${targetExpr}】の正しい読み方を一つ選びなさい。`;
+      }
+      correctOption = targetReading;
+      distractors = generateSmartDistractors(currentItem, filteredMasterPool, 'KanjiReading', 3);
+      explanationEn = `「${targetExpr}」is read as「${targetReading}」(${meaningEn}).`;
+      explanationAr = `تُقرأ كلمة「${targetExpr}」بـ「${targetReading}」(بمعنى: ${meaningAr || meaningEn}).`;
+    } else if (mondaiSubtype === 'Mondai2_Orthography') {
+      // Mondai 2: Orthography (Hiragana -> Kanji)
+      if (example && example.includes(targetExpr)) {
+        promptText = example.replace(targetExpr, `【${targetReading}】`);
+      } else {
+        promptText = `次の文の【${targetReading}】は漢字でどう書きますか。(${meaningEn})`;
+      }
+      correctOption = targetExpr;
+      distractors = generateSmartDistractors(currentItem, filteredMasterPool, 'Orthography', 3);
+      explanationEn = `「${targetReading}」is written with the kanji「${targetExpr}」(${meaningEn}).`;
+      explanationAr = `يُكتب اللفظ「${targetReading}」بالكانجي「${targetExpr}」(بمعنى: ${meaningAr || meaningEn}).`;
+    } else if (mondaiSubtype === 'Mondai3_Contextual') {
+      // Mondai 3: Context Vocab (Fill in the blank)
+      if (example && example.includes(targetExpr)) {
+        promptText = example.replace(targetExpr, '【　　】');
+      } else {
+        promptText = `次の文の【　　】に入る最も適当な語句を選びなさい：(${meaningEn})`;
+      }
+      correctOption = targetExpr;
+      distractors = generateSmartDistractors(currentItem, filteredMasterPool, 'Contextual', 3);
+      explanationEn = `The blank requires「${targetExpr}」(${meaningEn}), which fits the context appropriately.`;
+      explanationAr = `السياق يتطلب توظيف「${targetExpr}」(بمعنى: ${meaningAr || meaningEn}) ليكتمل المعنى بصورة صحيحة.`;
+    } else if (mondaiSubtype === 'Mondai4_Paraphrase') {
+      // Mondai 4: Paraphrases / Synonyms
+      promptText = `「${targetExpr}」に最も意味が近い表現を一つ選びなさい。(${meaningEn})`;
+      correctOption = meaningEn;
+      distractors = shuffleArray(
+        filteredMasterPool
+          .filter((i) => i.id !== currentItem.id && i.meaningEn)
+          .map((i) => i.meaningEn)
+      ).slice(0, 3);
+      explanationEn = `「${targetExpr}」(${targetReading}) closely translates to: "${meaningEn}".`;
+      explanationAr = `أقرب مرادف لمعنى「${targetExpr}」هو: "${meaningAr || meaningEn}".`;
     } else {
-      promptText = currentItem.example
-        ? currentItem.example.replace(currentItem.expr, '【　　】')
-        : `Choose the correct term matching: "${currentItem.meaningEn}"`;
-      targetAnswer = currentItem.expr;
+      // Mondai 5: Usage (用法)
+      promptText = `次の言葉の使い方として最も適切なものを一つ選びなさい。【${targetExpr}】`;
+      const correctSentence = example ? example : `この文章では「${targetExpr}」が自然に使われている。`;
+      correctOption = correctSentence;
+      const otherExamples = filteredMasterPool
+        .filter((i) => i.id !== currentItem.id && i.example)
+        .map((i) => i.example!);
+      distractors = shuffleArray(otherExamples).slice(0, 3);
+      while (distractors.length < 3) {
+        distractors.push(`文脈に合わない例文サンプル${distractors.length + 1}。`);
+      }
+      explanationEn = `「${targetExpr}」is correctly used in: "${correctSentence}".`;
+      explanationAr = `الاستخدام الصحيح والسليم لكلمة「${targetExpr}」هو في الجملة: "${correctSentence}".`;
     }
 
-    // Distractor candidates
-    const distractors = activeDeck
-      .filter((i) => i.id !== currentItem.id)
-      .map((i) => (quizSubtype === 'KanjiReading' ? i.reading : i.expr))
-      .filter((val) => val && val !== targetAnswer);
+    const { options, correctIndex } = shuffleQuestionOptions(correctOption, distractors);
 
-    const uniqueDistractors = Array.from(new Set(distractors)).slice(0, 3);
-
-    while (uniqueDistractors.length < 3) {
-      uniqueDistractors.push(`ダミー${uniqueDistractors.length + 1}`);
-    }
-
-    const optionsPool = [targetAnswer, ...uniqueDistractors];
-    // Deterministic shuffle
-    const hash = currentItem.id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-    const shuffled = [...optionsPool].sort((a, b) => {
-      const hA = (a.charCodeAt(0) * 17 + hash) % 100;
-      const hB = (b.charCodeAt(0) * 17 + hash) % 100;
-      return hA - hB;
+    // Build Option Glosses
+    const optionGlosses: OptionGloss[] = options.map((opt, idx) => {
+      const isCorrect = idx === correctIndex;
+      if (isCorrect) {
+        return {
+          option: opt,
+          meaningEn: `${targetExpr} (${meaningEn})`,
+          meaningAr: meaningAr || 'الصواب',
+          isCorrect: true,
+        };
+      }
+      const matched = filteredMasterPool.find((i) => i.expr === opt || i.reading === opt);
+      return {
+        option: opt,
+        meaningEn: matched ? `${matched.expr} (${matched.meaningEn})` : 'Alternative distractor option',
+        meaningAr: matched?.meaningAr || '',
+        whyWrongEn: 'Does not fit the question prompt or target reading',
+        isCorrect: false,
+      };
     });
 
-    const correctIndex = shuffled.indexOf(targetAnswer);
+    const clickableWords: ClickableWord[] = [
+      {
+        expr: targetExpr,
+        reading: targetReading,
+        meaningEn,
+        meaningAr,
+      },
+    ];
 
-    setQuizData({
+    setRichQuizData({
       promptText,
-      options: shuffled,
-      correctIndex: correctIndex >= 0 ? correctIndex : 0,
+      sentenceTranslationEn: exampleEn || meaningEn,
+      sentenceTranslationAr: exampleAr || meaningAr,
+      options,
+      correctIndex,
+      explanationEn,
+      explanationAr,
+      optionGlosses,
+      clickableWords,
+      sourceQuestionId: currentItem.id,
+      relatedItem: currentItem
+        ? {
+            expr: currentItem.expr,
+            reading: currentItem.reading,
+            meaningEn: currentItem.meaningEn,
+            meaningAr: currentItem.meaningAr,
+            subskill: currentItem.subskill,
+          }
+        : undefined,
     });
-  }, [currentItem?.id, quizSubtype, activeDeck.length]);
+  }, [currentItem, mondaiSubtype, filteredMasterPool, isMistakeMode, mistakesQueue, currentIndex]);
 
+  // Handle quiz option selection
   const handleSelectQuizOption = (optIdx: number) => {
-    if (quizAnswerRevealed || !quizData) return;
+    if (quizAnswerRevealed || !richQuizData) return;
     setQuizSelectedOption(optIdx);
     setQuizAnswerRevealed(true);
     recordPaceTime();
 
-    if (optIdx === quizData.correctIndex) {
+    const isCorrect = optIdx === richQuizData.correctIndex;
+
+    if (isCorrect) {
       if (currentItem) rateVocab(currentItem.id, 3); // Good
+      if (isMistakeMode && richQuizData.sourceQuestionId) {
+        const graduated = recordCorrectMistake(richQuizData.sourceQuestionId);
+        if (graduated) {
+          addToast('Question answered correctly 2x! Graduated from Mistakes queue!', 'success');
+        }
+        refreshMistakes();
+      }
     } else {
       if (currentItem) rateVocab(currentItem.id, 1); // Again / Weak
+      // Record to mistakes queue
+      const mockQToSave: MockQuestion = {
+        id: richQuizData.sourceQuestionId || `quiz-err-${Date.now()}`,
+        block: 1,
+        section: mondaiSubtype === 'Mondai1_Reading' ? 'KanjiReading' : 'Contextual',
+        mondai: 'mondai-1',
+        prompt: richQuizData.promptText,
+        options: richQuizData.options,
+        correct: richQuizData.correctIndex,
+        explanationEn: richQuizData.explanationEn,
+        explanationAr: richQuizData.explanationAr,
+        sentenceTranslationEn: richQuizData.sentenceTranslationEn,
+        sentenceTranslationAr: richQuizData.sentenceTranslationAr,
+        optionGlosses: richQuizData.optionGlosses,
+        clickableWords: richQuizData.clickableWords,
+        relatedItem: richQuizData.relatedItem,
+      };
+      recordMistake(mockQToSave);
+      refreshMistakes();
+      addToast('Saved to "Practice My Mistakes" queue!', 'info');
     }
   };
 
   const nextQuizCard = () => {
     setQuizSelectedOption(null);
     setQuizAnswerRevealed(false);
-    if (currentIndex < activeDeck.length - 1) {
+
+    const totalItems = isMistakeMode ? mistakesQueue.length : studyBatch.length;
+    if (currentIndex < totalItems - 1) {
       setCurrentIndex((prev) => prev + 1);
     } else {
-      setCurrentIndex(0);
+      if (!isMistakeMode) {
+        sampleNewBatch(filteredMasterPool, 15);
+        addToast('Sampled 15 fresh randomized cards!', 'info');
+      } else {
+        refreshMistakes();
+        setCurrentIndex(0);
+      }
     }
   };
 
@@ -227,11 +500,11 @@ export const VocabSRS: React.FC = () => {
             } else if (e.key === '4') handleRate(4);
           }
         } else if (mode === 'quiz') {
-          if (!quizAnswerRevealed && quizData) {
-            if (e.key === '1' && quizData.options[0]) handleSelectQuizOption(0);
-            else if (e.key === '2' && quizData.options[1]) handleSelectQuizOption(1);
-            else if (e.key === '3' && quizData.options[2]) handleSelectQuizOption(2);
-            else if (e.key === '4' && quizData.options[3]) handleSelectQuizOption(3);
+          if (!quizAnswerRevealed && richQuizData) {
+            if (e.key === '1' && richQuizData.options[0]) handleSelectQuizOption(0);
+            else if (e.key === '2' && richQuizData.options[1]) handleSelectQuizOption(1);
+            else if (e.key === '3' && richQuizData.options[2]) handleSelectQuizOption(2);
+            else if (e.key === '4' && richQuizData.options[3]) handleSelectQuizOption(3);
           } else if (quizAnswerRevealed && e.key === ' ') {
             e.preventDefault();
             nextQuizCard();
@@ -242,7 +515,10 @@ export const VocabSRS: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [subView, mode, isFlipped, quizAnswerRevealed, quizData, handleRate]);
+  }, [subView, mode, isFlipped, quizAnswerRevealed, richQuizData, handleRate]);
+
+  // Current mistake info if in mistake mode
+  const currentMistakeInfo = isMistakeMode ? mistakesQueue[currentIndex] : undefined;
 
   return (
     <div className="space-y-4">
@@ -255,19 +531,66 @@ export const VocabSRS: React.FC = () => {
             ? 'Kanji Visual Grid'
             : subView === 'categories'
             ? 'Thematic Categories'
+            : isMistakeMode
+            ? `Practice My Mistakes (${mistakesQueue.length})`
             : selectedCategory !== 'all'
             ? selectedCategory
             : mode === 'flashcard'
-            ? 'Vocab & Kanji SRS Flashcards'
-            : 'JLPT Multiple-Choice Quiz',
+            ? 'Randomized Vocab & Kanji SRS'
+            : 'Migii JLPT Mini-Quiz Engine',
         ]}
         currentStep={subView === 'drill' ? currentIndex + 1 : undefined}
-        totalSteps={subView === 'drill' ? activeDeck.length : undefined}
+        totalSteps={
+          subView === 'drill'
+            ? isMistakeMode
+              ? mistakesQueue.length
+              : studyBatch.length
+            : undefined
+        }
         targetPaceText={subView === 'drill' ? (avgSeconds > 0 ? `${avgSeconds}s avg` : '<50s per Q') : undefined}
         onExit={() => setActivePillar('today')}
         rightElement={
           subView === 'drill' && (
             <div className="flex items-center gap-1.5">
+              {/* 1-Tap Shuffle Now Button */}
+              {!isMistakeMode && (
+                <button
+                  onClick={() => {
+                    sampleNewBatch(filteredMasterPool, 15);
+                    addToast('Reshuffled active queue!', 'success');
+                  }}
+                  className="px-2.5 py-1 rounded-xl text-xs font-bold border bg-stationery-surface border-stationery-border text-ink-muted hover:text-indigo-primary hover:border-indigo-primary/40 transition flex items-center gap-1 shadow-xs"
+                  title="Reshuffle active queue now"
+                >
+                  <Shuffle className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Shuffle Now</span>
+                </button>
+              )}
+
+              {/* Mistakes Mode Toggle Button */}
+              <button
+                onClick={() => {
+                  const nextState = !isMistakeMode;
+                  setIsMistakeMode(nextState);
+                  setCurrentIndex(0);
+                  refreshMistakes();
+                  if (nextState) {
+                    setMode('quiz');
+                  }
+                }}
+                className={`px-2.5 py-1 rounded-xl text-xs font-bold border transition flex items-center gap-1 ${
+                  isMistakeMode
+                    ? 'bg-vermilion text-white border-vermilion shadow-xs'
+                    : mistakesQueue.length > 0
+                    ? 'bg-rose-50 border-rose-300 text-rose-800 hover:bg-rose-100'
+                    : 'bg-stationery-surface border-stationery-border text-ink-muted'
+                }`}
+                title="Practice questions you answered incorrectly (Leaves queue after 2 correct answers)"
+              >
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>Mistakes ({mistakesQueue.length})</span>
+              </button>
+
               <button
                 onClick={() => {
                   setUnmasteredOnly(!unmasteredOnly);
@@ -306,16 +629,19 @@ export const VocabSRS: React.FC = () => {
       <div className="max-w-4xl mx-auto px-4 pt-1">
         <div className="bg-white p-1.5 rounded-2xl border border-stationery-border shadow-xs flex items-center justify-between gap-1 overflow-x-auto scrollbar-none">
           <button
-            onClick={() => setSubView('drill')}
+            onClick={() => {
+              setIsMistakeMode(false);
+              setSubView('drill');
+            }}
             className={`flex-1 py-2 px-2.5 sm:px-3 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px] ${
-              subView === 'drill'
+              subView === 'drill' && !isMistakeMode
                 ? 'bg-indigo-primary text-white shadow-xs'
                 : 'text-ink-muted hover:text-ink hover:bg-stationery-surface'
             }`}
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span className="sm:hidden">Drill ({activeDeck.length})</span>
-            <span className="hidden sm:inline">Drill &amp; Quiz ({activeDeck.length})</span>
+            <span className="sm:hidden">Study ({studyBatch.length})</span>
+            <span className="hidden sm:inline">Randomized Drill &amp; Quiz ({studyBatch.length})</span>
           </button>
 
           <button
@@ -354,6 +680,7 @@ export const VocabSRS: React.FC = () => {
             onSelectCategoryDrill={(category, onlyUnmastered) => {
               setSelectedCategory(category);
               setUnmasteredOnly(onlyUnmastered);
+              setIsMistakeMode(false);
               setCurrentIndex(0);
               setSubView('drill');
             }}
@@ -370,6 +697,7 @@ export const VocabSRS: React.FC = () => {
             onDrillUnmastered={() => {
               setSubskillFilter('Kanji');
               setUnmasteredOnly(true);
+              setIsMistakeMode(false);
               setCurrentIndex(0);
               setSubView('drill');
             }}
@@ -379,9 +707,28 @@ export const VocabSRS: React.FC = () => {
 
       {/* 5. Sub-View: Active Study & Drill Canvas */}
       {subView === 'drill' && (
-        <div className="max-w-2xl mx-auto px-4 py-2 sm:py-4 space-y-5 animate-fade-in">
+        <div className="max-w-2xl mx-auto px-4 py-2 sm:py-4 space-y-4 animate-fade-in">
+          {/* Mistakes Banner if in Mistakes Mode */}
+          {isMistakeMode && (
+            <div className="bg-rose-50 border border-rose-300 px-4 py-2.5 rounded-2xl flex items-center justify-between text-xs text-rose-900 shadow-xs">
+              <span className="font-bold flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600" />
+                <span>Practice My Mistakes: {mistakesQueue.length} question(s) waiting</span>
+              </span>
+              <button
+                onClick={() => {
+                  setIsMistakeMode(false);
+                  setCurrentIndex(0);
+                }}
+                className="underline hover:text-rose-950 font-bold"
+              >
+                Exit Mistakes
+              </button>
+            </div>
+          )}
+
           {/* Active Category banner if filtered */}
-          {selectedCategory !== 'all' && (
+          {selectedCategory !== 'all' && !isMistakeMode && (
             <div className="bg-indigo-50 border border-indigo-200 px-4 py-2 rounded-2xl flex items-center justify-between text-xs text-indigo-900">
               <span className="font-bold flex items-center gap-1.5">
                 <Filter className="w-3.5 h-3.5" /> Filtering by Theme: {selectedCategory}
@@ -416,75 +763,89 @@ export const VocabSRS: React.FC = () => {
                     : 'text-ink-muted hover:text-ink'
                 }`}
               >
-                Quiz Mode
+                Migii JLPT Quiz
               </button>
             </div>
 
-            {/* Subskill Filters */}
-            <div className="flex items-center gap-1 text-xs">
-              {(['all', 'Vocab', 'Kanji', 'Grammar'] as const).map((filter) => (
-                <button
-                  key={filter}
-                  onClick={() => {
-                    setSubskillFilter(filter);
-                    setCurrentIndex(0);
-                  }}
-                  className={`px-2.5 py-1 rounded-lg font-medium transition ${
-                    subskillFilter === filter
-                      ? 'bg-indigo-wash text-indigo-primary font-bold'
-                      : 'text-ink-muted hover:text-ink'
-                  }`}
-                >
-                  {filter === 'all' ? 'All' : filter}
-                </button>
-              ))}
-            </div>
+            {/* Subskill Filters (Only in normal study mode) */}
+            {!isMistakeMode && (
+              <div className="flex items-center gap-1 text-xs">
+                {(['all', 'Vocab', 'Kanji', 'Grammar'] as const).map((filter) => (
+                  <button
+                    key={filter}
+                    onClick={() => {
+                      setSubskillFilter(filter);
+                      setCurrentIndex(0);
+                    }}
+                    className={`px-2.5 py-1 rounded-lg font-medium transition ${
+                      subskillFilter === filter
+                        ? 'bg-indigo-wash text-indigo-primary font-bold'
+                        : 'text-ink-muted hover:text-ink'
+                    }`}
+                  >
+                    {filter === 'all' ? 'All' : filter}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          {/* Quiz Subtype Selector (when in Quiz mode) */}
-          {mode === 'quiz' && (
-            <div className="flex items-center justify-center gap-1 bg-white p-1.5 rounded-2xl border border-stationery-border text-xs">
-              {(['KanjiReading', 'Orthography', 'Contextual'] as const).map((subtype) => (
+          {/* Migii Official Mondai Subtype Selector (when in Quiz mode) */}
+          {mode === 'quiz' && !isMistakeMode && (
+            <div className="flex items-center gap-1 bg-white p-1.5 rounded-2xl border border-stationery-border text-xs overflow-x-auto scrollbar-none">
+              {(
+                [
+                  { id: 'Mondai1_Reading', label: 'Mondai 1: 漢字読み (Reading)' },
+                  { id: 'Mondai2_Orthography', label: 'Mondai 2: 表記 (Orthography)' },
+                  { id: 'Mondai3_Contextual', label: 'Mondai 3: 文脈規定 (Context)' },
+                  { id: 'Mondai4_Paraphrase', label: 'Mondai 4: 言い換え (Paraphrase)' },
+                  { id: 'Mondai5_Usage', label: 'Mondai 5: 用法 (Usage)' },
+                ] as const
+              ).map((tab) => (
                 <button
-                  key={subtype}
-                  onClick={() => setQuizSubtype(subtype)}
-                  className={`flex-1 py-1.5 px-2 rounded-xl font-medium transition ${
-                    quizSubtype === subtype
+                  key={tab.id}
+                  onClick={() => setMondaiSubtype(tab.id)}
+                  className={`flex-1 py-1.5 px-2 rounded-xl font-medium transition whitespace-nowrap text-center ${
+                    mondaiSubtype === tab.id
                       ? 'bg-indigo-primary text-white font-bold shadow-xs'
-                      : 'text-ink-muted hover:text-ink'
+                      : 'text-ink-muted hover:text-ink hover:bg-stationery-surface'
                   }`}
                 >
-                  {subtype === 'KanjiReading'
-                    ? 'Reading (読み)'
-                    : subtype === 'Orthography'
-                    ? 'Orthography (表記)'
-                    : 'Contextual (文脈)'}
+                  {tab.label}
                 </button>
               ))}
             </div>
           )}
 
-          {/* Deck Empty State */}
+          {/* Empty State */}
           {!currentItem && (
             <div className="bg-white rounded-3xl border border-stationery-border p-10 text-center space-y-4 shadow-xs">
               <div className="w-12 h-12 rounded-2xl bg-jade-wash text-jade mx-auto flex items-center justify-center">
                 <CheckCircle2 className="w-6 h-6" />
               </div>
-              <h3 className="text-lg font-bold text-ink">Active Review Deck Completed!</h3>
+              <h3 className="text-lg font-bold text-ink">
+                {isMistakeMode ? 'No Mistakes in Queue!' : 'Active Study Deck Completed!'}
+              </h3>
               <p className="text-xs text-ink-muted max-w-sm mx-auto">
-                No cards match your current filter. You can switch to All Cards or clear the unmastered filter.
+                {isMistakeMode
+                  ? 'Great job! You have cleared all your mistakes or haven’t missed any questions yet.'
+                  : 'No cards match your current filter. You can switch to All Cards or generate a new batch.'}
               </p>
               <button
                 onClick={() => {
-                  setUnmasteredOnly(false);
-                  setLeechOnly(false);
-                  setSelectedCategory('all');
-                  setSubskillFilter('all');
-                  setCurrentIndex(0);
+                  if (isMistakeMode) {
+                    setIsMistakeMode(false);
+                  } else {
+                    setUnmasteredOnly(false);
+                    setLeechOnly(false);
+                    setSelectedCategory('all');
+                    setSubskillFilter('all');
+                    sampleNewBatch(vocabItems, 15);
+                  }
                 }}
                 className="px-5 py-2.5 rounded-xl bg-indigo-primary text-white text-xs font-bold hover:bg-indigo-light transition shadow-xs"
               >
-                Reset All Filters
+                {isMistakeMode ? 'Return to Study' : 'Reset All Filters & Reshuffle'}
               </button>
             </div>
           )}
@@ -533,7 +894,7 @@ export const VocabSRS: React.FC = () => {
                       </div>
                     </div>
                   ) : (
-                    /* Back: Trilingual Meaning Breakdown */
+                    /* Back: Trilingual Meaning Breakdown with Tap-to-Lookup Words */
                     <div className="w-full text-left space-y-4 animate-fade-in">
                       <BilingualBlock
                         expr={currentItem.expr}
@@ -545,6 +906,27 @@ export const VocabSRS: React.FC = () => {
                         exampleAr={currentItem.exampleAr}
                         variant="breakdown"
                       />
+
+                      {currentItem.example && (
+                        <div className="pt-2 border-t border-stationery-border/70">
+                          <span className="text-[10px] font-bold text-ink-muted uppercase tracking-wider block mb-1">
+                            Tap Sentence Words to Lookup &amp; Add:
+                          </span>
+                          <InteractiveSentence
+                            sentence={currentItem.example}
+                            clickableWords={[
+                              {
+                                expr: currentItem.expr,
+                                reading: currentItem.reading,
+                                meaningEn: currentItem.meaningEn,
+                                meaningAr: currentItem.meaningAr,
+                              },
+                            ]}
+                            onAddToWeakQueue={(word) => enqueueWeakItem(word)}
+                            className="text-sm text-ink-secondary"
+                          />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -555,7 +937,7 @@ export const VocabSRS: React.FC = () => {
                 </div>
               </div>
 
-              {/* FSRS Rating Buttons with Live Frequency Hints & Mobile Thumb Dock */}
+              {/* FSRS Rating Buttons */}
               <div className="sticky bottom-0 z-20 -mx-4 -mb-2 p-3 sm:static sm:p-0 sm:m-0 bg-white/95 sm:bg-transparent backdrop-blur-md sm:backdrop-blur-none border-t sm:border-t-0 border-stationery-border pb-dock-safe sm:pb-0 shadow-lg sm:shadow-none">
                 {isFlipped && nextIntervals ? (
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-2.5 animate-slide-in">
@@ -587,7 +969,7 @@ export const VocabSRS: React.FC = () => {
                       </span>
                     </button>
 
-                    {/* Good (3) ★ - High-contrast Primary Button */}
+                    {/* Good (3) ★ */}
                     <button
                       onClick={() => handleRate(3)}
                       className="min-h-[50px] flex flex-col items-center justify-center py-2.5 px-2 rounded-2xl bg-indigo-primary hover:bg-indigo-light text-white font-bold transition shadow-md group"
@@ -616,7 +998,7 @@ export const VocabSRS: React.FC = () => {
                     </button>
                   </div>
                 ) : (
-                  /* Unflipped Single Primary CTA */
+                  /* Unflipped CTA */
                   <button
                     onClick={() => setIsFlipped(true)}
                     className="w-full min-h-[48px] py-3.5 px-4 rounded-2xl bg-indigo-primary hover:bg-indigo-light text-white text-xs sm:text-sm font-bold shadow-md transition flex items-center justify-center gap-2"
@@ -629,94 +1011,98 @@ export const VocabSRS: React.FC = () => {
             </div>
           )}
 
-          {/* Official JLPT Quiz Mode Display */}
-          {mode === 'quiz' && currentItem && quizData && (
-            <div className="bg-white rounded-3xl border border-stationery-border p-6 sm:p-8 shadow-xs space-y-6">
-              <div className="flex items-center justify-between text-xs text-ink-muted border-b border-stationery-border pb-3">
-                <span className="font-semibold text-indigo-primary">
-                  N3 Practice: {quizSubtype}
-                </span>
-                <MasteryPillSelector
-                  currentLevel={currentItem.masteryLevel || 2}
-                  onSelect={(level) => updateItemMastery(currentItem.id, level)}
-                  size="sm"
-                  showHints={false}
-                />
-              </div>
-
-              {/* Prompt */}
-              <div className="text-xl sm:text-2xl font-bold font-jp text-ink leading-relaxed py-2">
-                <FuriganaText expr={quizData.promptText} />
-              </div>
-
-              {/* 4 Bubble Options */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-                {quizData.options.map((opt, idx) => {
-                  const isSelected = quizSelectedOption === idx;
-                  const isCorrect = idx === quizData.correctIndex;
-
-                  let optStyle =
-                    'bg-white border-stationery-border text-ink hover:border-indigo-primary/50';
-
-                  if (quizAnswerRevealed) {
-                    if (isCorrect) {
-                      optStyle = 'bg-emerald-50 border-emerald-500 text-emerald-900 font-bold';
-                    } else if (isSelected) {
-                      optStyle = 'bg-rose-50 border-rose-400 text-rose-800 font-bold';
-                    } else {
-                      optStyle =
-                        'bg-stationery-surface/50 border-stationery-border/60 text-ink-muted opacity-50';
-                    }
-                  }
-
-                  return (
-                    <button
-                      key={idx}
-                      onClick={() => handleSelectQuizOption(idx)}
-                      disabled={quizAnswerRevealed}
-                      className={`flex items-center justify-between p-4 rounded-2xl border text-left text-base font-jp transition-all duration-150 ${optStyle}`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="w-6 h-6 rounded-full bg-stationery-surface border border-current/20 flex items-center justify-center font-mono font-bold text-xs opacity-75">
-                          {idx + 1}
-                        </span>
-                        <span>{opt}</span>
-                      </div>
-
-                      {quizAnswerRevealed && isCorrect && (
-                        <CheckCircle2 className="w-5 h-5 text-emerald-600 flex-shrink-0" />
-                      )}
-                      {quizAnswerRevealed && isSelected && !isCorrect && (
-                        <XCircle className="w-5 h-5 text-rose-500 flex-shrink-0" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Answer Breakdown after answering */}
-              {quizAnswerRevealed && (
-                <div className="space-y-4 pt-2 animate-fade-in">
-                  <BilingualBlock
-                    expr={currentItem.expr}
-                    reading={currentItem.reading}
-                    meaningEn={currentItem.meaningEn}
-                    meaningAr={currentItem.meaningAr}
-                    example={currentItem.example}
-                    exampleEn={currentItem.exampleEn}
-                    exampleAr={currentItem.exampleAr}
-                    variant="breakdown"
+          {/* Migii Official JLPT Quiz Mode Display */}
+          {mode === 'quiz' && currentItem && richQuizData && (
+            <div className="space-y-4">
+              <div className="bg-white rounded-3xl border border-stationery-border p-6 sm:p-8 shadow-xs space-y-6">
+                <div className="flex items-center justify-between text-xs text-ink-muted border-b border-stationery-border pb-3">
+                  <span className="font-semibold text-indigo-primary flex items-center gap-1.5">
+                    <BookOpen className="w-3.5 h-3.5" />
+                    {isMistakeMode
+                      ? `Reviewing Mistake #${currentIndex + 1}`
+                      : `Official N3: ${mondaiSubtype.replace('_', ' ')}`}
+                  </span>
+                  <MasteryPillSelector
+                    currentLevel={currentItem.masteryLevel || 2}
+                    onSelect={(level) => updateItemMastery(currentItem.id, level)}
+                    size="sm"
+                    showHints={false}
                   />
-
-                  {/* Single Primary Action Button */}
-                  <button
-                    onClick={nextQuizCard}
-                    className="w-full py-3.5 rounded-2xl bg-indigo-primary text-white text-xs sm:text-sm font-bold hover:bg-indigo-light transition shadow-md flex items-center justify-center gap-2"
-                  >
-                    <span>Next Question (Space)</span>
-                    <ChevronRight className="w-4 h-4" />
-                  </button>
                 </div>
+
+                {/* Prompt with Tap-to-Lookup Words */}
+                <div className="text-lg sm:text-xl font-bold font-jp text-ink leading-relaxed py-2">
+                  <InteractiveSentence
+                    sentence={richQuizData.promptText}
+                    clickableWords={richQuizData.clickableWords}
+                    onAddToWeakQueue={(word) => enqueueWeakItem(word)}
+                  />
+                </div>
+
+                {/* 4 Bubble Options (Fisher-Yates Shuffled) */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                  {richQuizData.options.map((opt, idx) => {
+                    const isSelected = quizSelectedOption === idx;
+                    const isCorrect = idx === richQuizData.correctIndex;
+
+                    let optStyle =
+                      'bg-white border-stationery-border text-ink hover:border-indigo-primary/50';
+
+                    if (quizAnswerRevealed) {
+                      if (isCorrect) {
+                        optStyle = 'bg-emerald-50 border-emerald-500 text-emerald-900 font-bold';
+                      } else if (isSelected) {
+                        optStyle = 'bg-rose-50 border-rose-400 text-rose-800 font-bold';
+                      } else {
+                        optStyle =
+                          'bg-stationery-surface/50 border-stationery-border/60 text-ink-muted opacity-50';
+                      }
+                    }
+
+                    return (
+                      <button
+                        key={idx}
+                        onClick={() => handleSelectQuizOption(idx)}
+                        disabled={quizAnswerRevealed}
+                        className={`flex items-center justify-between p-4 rounded-2xl border text-left text-sm sm:text-base font-jp transition-all duration-150 ${optStyle}`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <span className="w-6 h-6 rounded-full bg-stationery-surface border border-current/20 flex items-center justify-center font-mono font-bold text-xs opacity-75">
+                            {idx + 1}
+                          </span>
+                          <span>{opt}</span>
+                        </div>
+
+                        {quizAnswerRevealed && isCorrect && (
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600 flex-shrink-0" />
+                        )}
+                        {quizAnswerRevealed && isSelected && !isCorrect && (
+                          <XCircle className="w-5 h-5 text-rose-500 flex-shrink-0" />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Instant Migii Learning Feedback Card */}
+              {quizAnswerRevealed && (
+                <MigiiFeedbackCard
+                  isCorrect={quizSelectedOption === richQuizData.correctIndex}
+                  selectedOptionIndex={quizSelectedOption !== null ? quizSelectedOption : -1}
+                  options={richQuizData.options}
+                  correctOptionIndex={richQuizData.correctIndex}
+                  optionGlosses={richQuizData.optionGlosses}
+                  sentenceTranslationEn={richQuizData.sentenceTranslationEn}
+                  sentenceTranslationAr={richQuizData.sentenceTranslationAr}
+                  explanationEn={richQuizData.explanationEn}
+                  explanationAr={richQuizData.explanationAr}
+                  currentMasteryLevel={currentItem.masteryLevel || 2}
+                  onRateMastery={(level) => updateItemMastery(currentItem.id, level)}
+                  onNextQuestion={nextQuizCard}
+                  isMistakeMode={isMistakeMode}
+                  consecutiveCorrect={currentMistakeInfo?.consecutiveCorrect || 0}
+                />
               )}
             </div>
           )}
