@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    min-height: 100dvh;
+    overflow-x: hidden;
+    background-color: #FAFAF8;
+    color: #1E293B;
+    font-family: 'Inter', sans-serif;
+  }
+
+  /* Japanese font styling */
+  .font-jp {
+    font-family: 'Noto Sans JP', 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+  }
+
+  /* Arabic font styling with strict RTL */
+  .font-arabic {
+    font-family: 'Noto Sans Arabic', 'Segoe UI Arabic', 'Tahoma', sans-serif;
+    direction: rtl;
+    unicode-bidi: isolate;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+
+  ruby {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    vertical-align: bottom;
+    line-height: 2.1;
+  }
+
+  rt {
+    font-size: 0.65em;
+    line-height: 1;
+    text-align: center;
+    user-select: none;
+    font-weight: 500;
+  }
+
+  /* Prevent iOS zoom on inputs and forms */
+  @media (max-width: 767px) {
+    input, select, textarea {
+      font-size: 16px !important;
+    }
+  }
+}
+
+/* Safe area insets helpers */
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+.pb-dock-safe {
+  padding-bottom: max(1rem, calc(0.75rem + env(safe-area-inset-bottom)));
+}
+
+/* Custom scrollbars */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.25s ease-out forwards;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-slide-in {
+  animation: slideIn 0.25s ease-out forwards;
+}
